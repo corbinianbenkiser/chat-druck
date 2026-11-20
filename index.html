@@ -170,13 +170,11 @@ const PAD = 3.5, YL = 8, CL = 6.5;                     // Abstände, Schriftgrö
 const BOTTOM = 842.7;                                  // Unterkante Skalen-Beschriftung
 
 function cbarTicks(vmax) {
-  const out = new Set();
-  for (let i = 0; i < 5; i++) {
-    const v = vmax * Math.pow(i / 4, 1 / GAMMA);
-    const r = v > 0 ? Number(v.toPrecision(1)) : 0;
-    if (r <= vmax) out.add(r);
-  }
-  return [...out].sort((a, b) => a - b);
+  // Feste Marken 0, 50, 100 … bis zum Maximum; bei kurzen Skalen kleinere Schritte
+  const step = [50, 20, 10, 5, 2, 1, 0.5].find(s => vmax >= 2 * s) ?? 0.5;
+  const out = [];
+  for (let v = 0; v <= vmax + 1e-9; v += step) out.push(Math.round(v * 10) / 10);
+  return out;
 }
 
 // A2 bei gegebener Auflösung zeichnen
