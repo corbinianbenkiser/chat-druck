@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat als Druck</title>
+<style>
+  :root {
+    --bg: #faf8f8; --fg: #2b2326; --muted: #7A8089; --line: #e6dfe1;
+    --accent: #B25172; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1b1719; --fg: #f1eaec; --muted: #a1a6ad; --line: #3a3236; --accent: #DFA0B2; --card: #262024; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-weight: 500; font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+  #drop {
+    display: block; border: 1.5px dashed var(--line); border-radius: 12px;
+    padding: 28px 16px; text-align: center; cursor: pointer; background: var(--card);
+    transition: border-color .15s;
+  }
+  #drop:hover, #drop.over { border-color: var(--accent); }
+  #drop input { display: none; }
+  #drop strong { color: var(--accent); font-weight: 500; }
+  #info { color: var(--muted); margin: 20px 0 12px; min-height: 1.5em; }
+  #info b { color: var(--fg); font-weight: 500; }
+  #result { display: none; }
+  #preview {
+    display: block; width: 100%; height: auto; background: #fff;
+    border-radius: 4px; box-shadow: 0 1px 2px rgba(0,0,0,.06), 0 8px 28px rgba(0,0,0,.08);
+  }
+  button {
+    font: inherit; border: 0; border-radius: 999px; padding: 10px 20px; margin: 0 0 20px;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  @media (prefers-color-scheme: dark) { button { color: #2b2326; } }
+  button:disabled { opacity: .55; cursor: progress; }
+  .note { color: var(--muted); font-size: 13px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Chat als Druck</h1>
+  <p class="sub">WhatsApp-Export rein, A2-Druck raus. Alles passiert nur in diesem Browser.</p>
+
+  <label id="drop">
+    <input type="file" id="file" accept=".txt,.zip">
+    Chat-Datei hierher ziehen oder <strong>auswählen</strong><br>
+    <span class="note">.txt oder .zip aus „Chat exportieren“</span>
+  </label>
+
+  <p id="info"></p>
+
+  <div id="result">
+    <button id="dl">Druck herunterladen (A2, 600 dpi)</button>
+    <canvas id="preview"></canvas>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ---------- Datei lesen (.txt oder .zip) ----------
+async function readChat(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  if (!file.name.toLowerCase().endsWith(".zip")) return new TextDecoder().decode(buf);
+  const dv = new DataView(buf.buffer);
+  let eocd = buf.length - 22;
+  while (eocd >= 0 && dv.getUint32(eocd, true) !== 0x06054b50) eocd--;
+  if (eocd < 0) throw new Error("Zip-Datei nicht lesbar");
+  let p = dv.getUint32(eocd + 16, true);
+  const count = dv.getUint16(eocd + 10, true);
+  for (let i = 0; i < count; i++) {
+    const method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true);
+    const nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+    const local = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(buf.subarray(p + 46, p + 46 + nl));
+    p += 46 + nl + el + cl;
+    if (!name.toLowerCase().endsWith(".txt") || name.startsWith("__MACOSX")) continue;
+    const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+    const data = buf.subarray(start, start + size);
+    if (method === 0) return new TextDecoder().decode(data);
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return await new Response(stream).text();
+  }
+  throw new Error("Keine .txt im Zip gefunden");
+}
+
+// ---------- Parsen: Nachrichten pro Tag ----------
+// iPhone:  [23.12.25, 15:45:10] Rike: Text
+// Android: 23/12/2025, 15:17 - Rike: Text   (auch 12/23/25, 3:17 PM - …)
+const LINE_RE = /^[‎‏]?\[?(\d{1,4})[.\/-](\d{1,2})[.\/-](\d{2,4}),?\s+\d{1,2}[:.]\d{2}(?:[:.]\d{2})?(?:\s*[AaPp]\.?\s?[Mm]\.?)?\]?\s*(?:-\s)?(.*)$/;
+const SENDER_RE = /^[^:]+?:\s?([\s\S]*)$/;
+const SYSTEM_RE = /end-to-end encrypted|is a contact\.?$|Ende-zu-Ende-verschl/;
+const DAY = 86400000;
+
+function parseDays(text) {
+  const msgs = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = LINE_RE.exec(line);
+    if (m) {
+      const s = SENDER_RE.exec(m[4]);   // ohne "Name:" ist es eine Systemzeile
+      msgs.push({ a: +m[1], b: +m[2], y: +m[3], text: s ? s[1] : null });
+    } else if (msgs.length && msgs[msgs.length - 1].text !== null) {
+      msgs[msgs.length - 1].text += "\n" + line;
+    }
+  }
+  // Reihenfolge erkennen: Jahr vorne, Tag/Monat oder Monat/Tag
+  const ymd = msgs.some(m => m.a > 999);
+  const mdy = !ymd && msgs.some(m => m.b > 12) && !msgs.some(m => m.a > 12);
+  return msgs
+    .filter(m => m.text !== null && !SYSTEM_RE.test(m.text.replaceAll("‎", "").trim()))
+    .map(m => {
+      let [y, mo, d] = ymd ? [m.a, m.b, m.y] : mdy ? [m.y, m.a, m.b] : [m.y, m.b, m.a];
+      if (y < 100) y += 2000;
+      return Date.UTC(y, mo - 1, d) / DAY;
+    });
+}
+
+// ---------- Daten fürs Quadrat ----------
+function buildGrid(days) {
+  let first = Infinity, last = -Infinity;
+  for (const d of days) { if (d < first) first = d; if (d > last) last = d; }
+  const k = Math.floor(Math.sqrt(last - first + 1));
+  const start = last - k * k + 1;
+  const counts = new Array(k * k).fill(0);
+  for (const d of days) if (d >= start) counts[d - start]++;
+
+  // vmax = 99. Perzentil der Tage mit Nachrichten (wie numpy, linear)
+  const nz = counts.filter(c => c > 0).sort((a, b) => a - b);
+  const pos = 0.99 * (nz.length - 1), lo = Math.floor(pos);
+  const p99 = nz[lo] + (nz[Math.min(lo + 1, nz.length - 1)] - nz[lo]) * (pos - lo);
+  const vmax = Math.max(p99, 1);
+
+  const quarters = [];
+  const seen = new Set();
+  for (let i = 0; i < k; i++) {
+    const dt = new Date((start + i * k) * DAY);
+    const lab = `Q${Math.floor(dt.getUTCMonth() / 3) + 1} ${String(dt.getUTCFullYear() % 100).padStart(2, "0")}`;
+    if (!seen.has(lab)) { seen.add(lab); quarters.push([lab, i + 0.5]); }
+  }
+  return { k, start, first, counts, vmax, quarters };
+}
+
+// ---------- Farben ----------
+const STOPS = ["#ffffff", "#F3D4DC", "#DFA0B2", "#B25172", "#571A2E"].map(h =>
+  [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+const GAMMA = 0.55;
+function colorAt(t) {               // t in [0, 1]
+  t = Math.min(1, Math.max(0, t)) * (STOPS.length - 1);
+  const i = Math.min(Math.floor(t), STOPS.length - 2), f = t - i;
+  const c = STOPS[i].map((a, j) => Math.round(a + (STOPS[i + 1][j] - a) * f));
+  return `rgb(${c})`;
+}
+const norm = (v, vmax) => Math.pow(Math.max(0, v) / vmax, GAMMA);
+
+// ---------- Layout (in Punkt, übernommen aus der matplotlib-Version) ----------
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const GREY = "#7A8089";
+const AX = { x: 96.3, y: 19.7, s: 671.4 };            // Heatmap-Quadrat
+const CX = AX.x + AX.s / 2;                             // Mittelachse
+const CB = { w: 282.7, h: 5.65, y: 827.0 };            // Farbskala
+const PAD = 3.5, YL = 8, CL = 6.5;                     // Abstände, Schriftgrößen
+const BOTTOM = 842.7;                                  // Unterkante Skalen-Beschriftung
+
+function cbarTicks(vmax) {
+  const out = new Set();
+  for (let i = 0; i < 5; i++) {
+    const v = vmax * Math.pow(i / 4, 1 / GAMMA);
+    const r = v > 0 ? Number(v.toPrecision(1)) : 0;
+    if (r <= vmax) out.add(r);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+// A2 bei gegebener Auflösung zeichnen
+function render(g, dpi) {
+  const W = Math.round(42 / 2.54 * dpi), H = Math.round(59.4 / 2.54 * dpi);
+  const M = Math.round(4 / 2.54 * dpi);
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.font = `${YL}px ${FONT}`;
+  const labelW = Math.max(...g.quarters.map(([l]) => ctx.measureText(l).width));
+  const left = AX.x - PAD - labelW;
+  const half = Math.max(CX - left, AX.x + AX.s - CX);
+  const s = Math.min((W - 2 * M) / (2 * half), (H - 2 * M) / (BOTTOM - AX.y)); // px pro pt
+  const ox = W / 2 - CX * s, oy = H / 2 - (AX.y + BOTTOM) / 2 * s;
+  const X = x => ox + x * s, Y = y => oy + y * s;
+
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, W, H);
+
+  // Heatmap
+  const cell = AX.s / g.k;
+  const edge = (o, j) => Math.round(o + j * cell * s);
+  const x0 = X(AX.x), y0 = Y(AX.y);
+  for (let r = 0; r < g.k; r++) for (let c = 0; c < g.k; c++) {
+    const v = g.counts[r * g.k + c];
+    ctx.fillStyle = colorAt(norm(v, g.vmax));
+    const a = edge(x0, c), b = edge(y0, r);
+    ctx.fillRect(a, b, edge(x0, c + 1) - a, edge(y0, r + 1) - b);
+  }
+
+  // Quartals-Beschriftung
+  ctx.fillStyle = GREY;
+  ctx.font = `${YL * s}px ${FONT}`;
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const [lab, row] of g.quarters) ctx.fillText(lab, X(AX.x - PAD), Y(AX.y + row * cell));
+
+  // Farbskala
+  const cbx = CX - CB.w / 2;
+  const grad = ctx.createLinearGradient(X(cbx), 0, X(cbx + CB.w), 0);
+  for (let i = 0; i <= 32; i++) grad.addColorStop(i / 32, colorAt(i / 32));
+  ctx.fillStyle = grad;
+  ctx.fillRect(X(cbx), Y(CB.y), CB.w * s, CB.h * s);
+
+  ctx.fillStyle = GREY;
+  ctx.font = `${CL * s}px ${FONT}`;
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const t of cbarTicks(g.vmax))
+    ctx.fillText(String(t), X(cbx + norm(t, g.vmax) * CB.w), Y(CB.y + CB.h + PAD));
+  return canvas;
+}
+
+// ---------- PNG mit dpi-Angabe (pHYs) ----------
+const CRC = new Uint32Array(256).map((_, n) => {
+  let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0;
+});
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+async function withDpi(blob, dpi) {
+  const png = new Uint8Array(await blob.arrayBuffer());
+  const chunk = new Uint8Array(21), dv = new DataView(chunk.buffer);
+  const ppm = Math.round(dpi / 0.0254);
+  dv.setUint32(0, 9);
+  chunk.set([0x70, 0x48, 0x59, 0x73], 4);           // "pHYs"
+  dv.setUint32(8, ppm); dv.setUint32(12, ppm); chunk[16] = 1;
+  dv.setUint32(17, crc32(chunk.subarray(4, 17)));
+  return new Blob([png.subarray(0, 33), chunk, png.subarray(33)], { type: "image/png" });
+}
+const toBlob = c => new Promise(res => c.toBlob(res, "image/png"));
+
+// ---------- Oberfläche ----------
+const $ = id => document.getElementById(id);
+const fmt = d => new Date(d * DAY).toLocaleDateString("de-DE", { timeZone: "UTC" });
+let grid = null;
+
+async function load(file) {
+  if (!file) return;
+  $("info").textContent = "Lese Chat …";
+  $("result").style.display = "none";
+  try {
+    const days = parseDays(await readChat(file));
+    if (!days.length) throw new Error("Keine Nachrichten gefunden – ist das ein WhatsApp-Export?");
+    grid = buildGrid(days);
+    const cut = grid.start - grid.first;
+    $("info").innerHTML =
+      `<b>${grid.k} × ${grid.k} Tage</b> · ${fmt(grid.start)} – ${fmt(grid.start + grid.k * grid.k - 1)}` +
+      (cut ? ` · die ersten ${cut} Tage wurden für das Quadrat abgeschnitten` : "");
+
+    const prev = render(grid, 2 * 72), out = $("preview");
+    out.width = prev.width; out.height = prev.height;
+    out.getContext("2d").drawImage(prev, 0, 0);
+    $("result").style.display = "block";
+  } catch (e) {
+    $("info").textContent = e.message;
+  }
+}
+
+$("file").addEventListener("change", e => load(e.target.files[0]));
+const drop = $("drop");
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => {
+  e.preventDefault(); drop.classList.remove("over");
+  load(e.dataTransfer.files[0]);
+});
+
+$("dl").addEventListener("click", async () => {
+  const btn = $("dl"), label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Wird erstellt …";
+  await new Promise(r => setTimeout(r, 30));
+  try {
+    for (const dpi of [600, 400, 300, 200]) {          // Fallback, falls der Browser so große Bilder nicht kann
+      const c = render(grid, dpi);
+      const blob = c && await toBlob(c);
+      if (c) { c.width = c.height = 0; }
+      if (!blob) continue;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(await withDpi(blob, dpi));
+      a.download = dpi === 600 ? "druck.png" : `druck_${dpi}dpi.png`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      return;
+    }
+    alert("Der Browser konnte das Bild nicht erzeugen.");
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+});
+</script>
+</body>
+</html>
